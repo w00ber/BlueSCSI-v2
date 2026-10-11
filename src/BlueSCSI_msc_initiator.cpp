@@ -53,6 +53,7 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
 int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {return -1;}
 int32_t init_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) { return -1;}
 void init_msc_write10_complete_cb(uint8_t lun) {}
+int32_t init_msc_request_sense_cb(uint8_t lun, uint8_t *buffer, uint16_t bufsize) { return 18; }
 
 #else
 
@@ -114,14 +115,21 @@ static struct {
     // Scan new targets if none found
     uint32_t last_scan_time;
 
-    // Target reported UNIT ATTENTION (e.g. cartridge change) that the USB host
-    // has not been told about yet. Indexed by LUN.
+    // Medium change (e.g. cartridge swapped or removed) that the USB host has
+    // not been told about yet. Reported once via TEST UNIT READY or REQUEST SENSE.
+    // Indexed by LUN.
     bool media_changed[NUM_SCSIID];
+
+    // Fail reads until the host revalidates the medium (TEST UNIT READY succeeds
+    // or it re-reads the capacity). A host that only retries the failed READ
+    // would otherwise get the new cartridge's sector for a request it made
+    // about the old one. Indexed by LUN.
+    bool revalidate[NUM_SCSIID];
 } g_msc_initiator_state;
 
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
 static void invalidate_prefetch();
-static void note_media_change(uint8_t lun);
+static void note_media_change(uint8_t lun, const char *reason);
 static int get_lun_for_target(int target_id);
 static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, const uint8_t *buffer, bool use_write10);
 
@@ -309,7 +317,7 @@ void poll_msc_initiator()
             if (sense_key == UNIT_ATTENTION)
             {
                 int lun = get_lun_for_target(g_msc_initiator_state.prefetch_target_id);
-                if (lun >= 0) note_media_change(lun);
+                if (lun >= 0) note_media_change(lun, "UNIT_ATTENTION during read-ahead");
             }
         }
 
@@ -375,18 +383,46 @@ static bool prefetch_usable(int target_id, uint32_t sectorsize)
     return true;
 }
 
-// The target reported UNIT ATTENTION, typically because a removable cartridge
-// was changed. Any cached data is from the old medium, and the USB host must be
-// told too, or it keeps using the old medium's capacity, partition map and file
-// system (and reads silently return the wrong data).
-static void note_media_change(uint8_t lun)
+// The medium changed under the host: the target reported UNIT ATTENTION
+// (cartridge swapped) or a read found no medium (cartridge ejected with the
+// drive's button). Any cached data is from the old medium, and the USB host must
+// be told too, or it keeps using the old medium's capacity, partition map and
+// file system (and reads silently return the wrong data).
+static void note_media_change(uint8_t lun, const char *reason)
 {
-    logmsg("SCSI Initiator: UNIT_ATTENTION on LUN ", (int)lun, ", medium may have changed");
+    logmsg("SCSI Initiator: ", reason, " on LUN ", (int)lun, ", medium may have changed");
     invalidate_prefetch();
     if (lun < NUM_SCSIID)
     {
         g_msc_initiator_state.media_changed[lun] = true;
+        g_msc_initiator_state.revalidate[lun] = true;
     }
+}
+
+static void medium_revalidated(uint8_t lun)
+{
+    if (lun < NUM_SCSIID && g_msc_initiator_state.revalidate[lun])
+    {
+        dbgmsg("Host revalidated LUN ", (int)lun);
+        g_msc_initiator_state.revalidate[lun] = false;
+    }
+}
+
+// TinyUSB answers REQUEST SENSE from its own state, which after a failed READ is
+// always NOT READY / MEDIUM NOT PRESENT. Report a pending medium change instead,
+// so the host re-checks the medium rather than retrying the read indefinitely.
+int32_t init_msc_request_sense_cb(uint8_t lun, uint8_t *buffer, uint16_t bufsize)
+{
+    const int32_t len = 18; // fixed format sense data, already filled in by TinyUSB
+    if (lun < NUM_SCSIID && g_msc_initiator_state.media_changed[lun] && bufsize >= len)
+    {
+        g_msc_initiator_state.media_changed[lun] = false;
+        dbgmsg("-- MSC Request Sense: reporting medium change on LUN ", (int)lun);
+        buffer[2] = UNIT_ATTENTION;
+        buffer[12] = 0x28; // Not ready to ready change, medium may have changed
+        buffer[13] = 0x00;
+    }
+    return len;
 }
 
 static int get_lun_for_target(int target_id)
@@ -537,6 +573,7 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
 
     if (status == 0)
     {
+        medium_revalidated(lun);
         return true;
     }
     else if (status != 2)
@@ -586,6 +623,8 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
         {
             invalidate_prefetch();
         }
+
+        medium_revalidated(lun);
 
         // Remember the current capacity so it survives a not-ready phase
         g_msc_initiator_targets[lun].sectorcount = sectorcount;
@@ -715,10 +754,10 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             // A bad sector later in the window should not fail this chunk
             uint8_t sense_key;
             scsiRequestSense(target_id, &sense_key);
-            if (sense_key == UNIT_ATTENTION)
+            if (sense_key == UNIT_ATTENTION || sense_key == NOT_READY)
             {
                 LED_OFF();
-                note_media_change(lun);
+                note_media_change(lun, sense_key == UNIT_ATTENTION ? "UNIT_ATTENTION on read" : "NOT_READY on read");
                 return -1;
             }
             depth = 1;
@@ -735,9 +774,9 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             {
                 dbgmsg("SCSI Initiator read: RECOVERED_ERROR at ", (int)lba);
             }
-            else if (sense_key == UNIT_ATTENTION)
+            else if (sense_key == UNIT_ATTENTION || sense_key == NOT_READY)
             {
-                note_media_change(lun);
+                note_media_change(lun, sense_key == UNIT_ATTENTION ? "UNIT_ATTENTION on read" : "NOT_READY on read");
                 return -1;
             }
             else
@@ -780,6 +819,12 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
 
     if (g_msc_initiator_targets[lun].sectorsize == 0)
     {
+        return -1;
+    }
+
+    if (g_msc_initiator_state.revalidate[lun])
+    {
+        dbgmsg("USB Read command ", (int)lba, " refused: medium changed, waiting for host to revalidate");
         return -1;
     }
 
@@ -842,11 +887,11 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
         {
             dbgmsg("SCSI Initiator read: RECOVERED_ERROR at ", (int)orig_lba);
         }
-        else if (sense_key == UNIT_ATTENTION)
+        else if (sense_key == UNIT_ATTENTION || sense_key == NOT_READY)
         {
             // Nothing was read into the buffer. Returning success here would send
             // the host whatever the USB buffer last held.
-            note_media_change(lun);
+            note_media_change(lun, sense_key == UNIT_ATTENTION ? "UNIT_ATTENTION on read" : "NOT_READY on read");
             return -1;
         }
         else

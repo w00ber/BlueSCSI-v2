@@ -42,5 +42,6 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
 int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize);
 int32_t init_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize);
 void init_msc_write10_complete_cb(uint8_t lun);
+int32_t init_msc_request_sense_cb(uint8_t lun, uint8_t *buffer, uint16_t bufsize);
 
 

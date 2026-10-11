@@ -329,6 +329,16 @@ extern "C" bool tud_msc_test_unit_ready_cb(uint8_t lun)
   return g_MSC.unitReady && g_MSC.lun_unitReady[lun];
 }
 
+// Invoked after TinyUSB has filled in the REQUEST SENSE response from its own
+// sense state; may replace it. Returns the response length.
+extern "C" int32_t tud_msc_request_sense_cb(uint8_t lun, void* buffer, uint16_t bufsize)
+{
+  MSCScopedLock lock;
+  if (g_msc_initiator) return init_msc_request_sense_cb(lun, (uint8_t*)buffer, bufsize);
+
+  return sizeof(scsi_sense_fixed_resp_t);
+}
+
 // return size in blocks and block size
 extern "C" void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count,
                          uint16_t *block_size)
