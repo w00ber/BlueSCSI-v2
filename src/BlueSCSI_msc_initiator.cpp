@@ -76,6 +76,12 @@ static int g_msc_initiator_target_count;
 // has to walk the whole window before read-ahead is worth re-arming.
 #define MSC_PREFETCH_BACKOFF_READS 64
 
+// Read-ahead data older than this is discarded instead of served. A removable
+// cartridge can be swapped while the host is idle, and serving prefetched
+// sectors never touches the drive, so the drive gets no chance to report the
+// change. Sequential host reads arrive within milliseconds; a swap takes seconds.
+#define MSC_PREFETCH_MAX_AGE_MS 1000
+
 // Prefetch next sectors in main loop while USB is transferring previous one.
 static struct {
     uint8_t *prefetch_buffer; // Buffer to use for storing the data
@@ -88,6 +94,7 @@ static struct {
     uint32_t prefetch_backoff; // Reads left to skip after a failed prefetch
     bool prefetch_use_read10;
     bool prefetch_done; // True after prefetch is complete
+    uint32_t prefetch_time; // platform_millis() when prefetch data was last filled or used
 
     // Write staging for targets whose sector is larger than the USB chunk:
     // chunks accumulate in the prefetch buffer until a full sector is ready.
@@ -106,9 +113,16 @@ static struct {
 
     // Scan new targets if none found
     uint32_t last_scan_time;
+
+    // Target reported UNIT ATTENTION (e.g. cartridge change) that the USB host
+    // has not been told about yet. Indexed by LUN.
+    bool media_changed[NUM_SCSIID];
 } g_msc_initiator_state;
 
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
+static void invalidate_prefetch();
+static void note_media_change(uint8_t lun);
+static int get_lun_for_target(int target_id);
 static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, const uint8_t *buffer, bool use_write10);
 
 static void scan_targets()
@@ -275,6 +289,7 @@ void poll_msc_initiator()
         if (status == 0)
         {
             g_msc_initiator_state.prefetch_done = true;
+            g_msc_initiator_state.prefetch_time = platform_millis();
         }
         else
         {
@@ -286,6 +301,16 @@ void poll_msc_initiator()
             g_msc_initiator_state.prefetch_backoff = g_msc_initiator_state.prefetch_sectorcount
                                                    + MSC_PREFETCH_BACKOFF_READS;
             g_msc_initiator_state.prefetch_sectorcount = 0;
+
+            // A cartridge change shows up as UNIT ATTENTION on whichever command
+            // reaches the drive first, which may be this read-ahead.
+            uint8_t sense_key = 0;
+            scsiRequestSense(g_msc_initiator_state.prefetch_target_id, &sense_key);
+            if (sense_key == UNIT_ATTENTION)
+            {
+                int lun = get_lun_for_target(g_msc_initiator_state.prefetch_target_id);
+                if (lun >= 0) note_media_change(lun);
+            }
         }
 
         LED_OFF();
@@ -319,6 +344,58 @@ static bool is_removable_device(uint8_t lun)
     return (dtype == SCSI_DEVICE_TYPE_CD) ||
            (dtype == SCSI_DEVICE_TYPE_MO) ||
            (dtype == SCSI_DEVICE_TYPE_DIRECT_ACCESS && g_msc_initiator_targets[lun].is_removable);
+}
+
+// Drop read-ahead data, e.g. because it may belong to a cartridge that is no
+// longer in the drive.
+static void invalidate_prefetch()
+{
+    g_msc_initiator_state.prefetch_done = false;
+    g_msc_initiator_state.prefetch_sectorcount = 0;
+}
+
+// True if completed read-ahead data from this target can be served.
+// Expires stale data, see MSC_PREFETCH_MAX_AGE_MS.
+static bool prefetch_usable(int target_id, uint32_t sectorsize)
+{
+    if (!g_msc_initiator_state.prefetch_done ||
+        g_msc_initiator_state.prefetch_target_id != target_id ||
+        g_msc_initiator_state.prefetch_sectorsize != sectorsize)
+    {
+        return false;
+    }
+
+    if ((uint32_t)(platform_millis() - g_msc_initiator_state.prefetch_time) > MSC_PREFETCH_MAX_AGE_MS)
+    {
+        dbgmsg("Discarding read-ahead data older than ", (int)MSC_PREFETCH_MAX_AGE_MS, " ms");
+        invalidate_prefetch();
+        return false;
+    }
+
+    return true;
+}
+
+// The target reported UNIT ATTENTION, typically because a removable cartridge
+// was changed. Any cached data is from the old medium, and the USB host must be
+// told too, or it keeps using the old medium's capacity, partition map and file
+// system (and reads silently return the wrong data).
+static void note_media_change(uint8_t lun)
+{
+    logmsg("SCSI Initiator: UNIT_ATTENTION on LUN ", (int)lun, ", medium may have changed");
+    invalidate_prefetch();
+    if (lun < NUM_SCSIID)
+    {
+        g_msc_initiator_state.media_changed[lun] = true;
+    }
+}
+
+static int get_lun_for_target(int target_id)
+{
+    for (int lun = 0; lun < g_msc_initiator_target_count; lun++)
+    {
+        if (g_msc_initiator_targets[lun].target_id == target_id) return lun;
+    }
+    return -1;
 }
 
 void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
@@ -404,6 +481,7 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
     // LoEj moves media, so only removable devices get it
     if (load_eject && is_removable_device(lun))
     {
+        invalidate_prefetch();
         logmsg(start ? "Loading removable media" : "Ejecting removable media");
         command[4] |= 2;
     }
@@ -436,8 +514,53 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
         return false;
     }
 
+    if (lun >= g_msc_initiator_target_count)
+    {
+        return false;
+    }
+
     g_msc_initiator_state.status_reqcount++;
-    return scsiTestUnitReady(get_target(lun));
+
+    // Report a medium change noticed by an earlier command, once
+    if (g_msc_initiator_state.media_changed[lun])
+    {
+        g_msc_initiator_state.media_changed[lun] = false;
+        platform_msc_set_sense(lun, UNIT_ATTENTION, 0x28, 0x00); // Not ready to ready change, medium may have changed
+        return false;
+    }
+
+    // Not scsiTestUnitReady(): it clears UNIT ATTENTION by retrying, which would
+    // hide a cartridge change from the USB host. Pass the target's status through.
+    int target = get_target(lun);
+    uint8_t command[6] = {0x00, 0, 0, 0, 0, 0};
+    int status = scsiInitiatorRunCommand(target, command, sizeof(command), NULL, 0, NULL, 0);
+
+    if (status == 0)
+    {
+        return true;
+    }
+    else if (status != 2)
+    {
+        // No response; TinyUSB reports "medium not present"
+        return false;
+    }
+
+    uint8_t sense_key = 0, asc = 0, ascq = 0;
+    scsiRequestSense(target, &sense_key, &asc, &ascq);
+
+    if (sense_key == UNIT_ATTENTION)
+    {
+        dbgmsg("Target ", target, " reports UNIT_ATTENTION, passing it to the USB host");
+        invalidate_prefetch();
+        platform_msc_set_sense(lun, UNIT_ATTENTION, asc ? asc : 0x28, ascq);
+    }
+    else if (sense_key != NO_SENSE)
+    {
+        // e.g. NOT READY / MEDIUM NOT PRESENT (3A) or BECOMING READY (04/01)
+        platform_msc_set_sense(lun, sense_key, asc, ascq);
+    }
+
+    return false;
 }
 
 void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
@@ -458,6 +581,12 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
 
     if (success && sectorcount > 0)
     {
+        if (sectorcount != g_msc_initiator_targets[lun].sectorcount ||
+            sectorsize != g_msc_initiator_targets[lun].sectorsize)
+        {
+            invalidate_prefetch();
+        }
+
         // Remember the current capacity so it survives a not-ready phase
         g_msc_initiator_targets[lun].sectorcount = sectorcount;
         g_msc_initiator_targets[lun].sectorsize = sectorsize;
@@ -563,9 +692,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
         return -1;
     }
 
-    bool covered = g_msc_initiator_state.prefetch_done
-                && g_msc_initiator_state.prefetch_target_id == target_id
-                && g_msc_initiator_state.prefetch_sectorsize == sectorsize
+    bool covered = prefetch_usable(target_id, sectorsize)
                 && lba >= g_msc_initiator_state.prefetch_lba
                 && lba < g_msc_initiator_state.prefetch_lba + g_msc_initiator_state.prefetch_sectorcount;
 
@@ -588,6 +715,12 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             // A bad sector later in the window should not fail this chunk
             uint8_t sense_key;
             scsiRequestSense(target_id, &sense_key);
+            if (sense_key == UNIT_ATTENTION)
+            {
+                LED_OFF();
+                note_media_change(lun);
+                return -1;
+            }
             depth = 1;
             status = do_read6_or_10(target_id, lba, depth, sectorsize,
                                     g_msc_initiator_state.prefetch_buffer, use_read10);
@@ -602,11 +735,15 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             {
                 dbgmsg("SCSI Initiator read: RECOVERED_ERROR at ", (int)lba);
             }
+            else if (sense_key == UNIT_ATTENTION)
+            {
+                note_media_change(lun);
+                return -1;
+            }
             else
             {
                 scsiLogInitiatorCommandFailure("SCSI Initiator read", target_id, status, sense_key);
-                g_msc_initiator_state.prefetch_sectorcount = 0;
-                g_msc_initiator_state.prefetch_done = false;
+                invalidate_prefetch();
                 return -1;
             }
         }
@@ -618,6 +755,8 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
         g_msc_initiator_state.prefetch_use_read10 = use_read10;
         g_msc_initiator_state.prefetch_done = true;
     }
+
+    g_msc_initiator_state.prefetch_time = platform_millis();
 
     uint32_t len = sectorsize - offset;
     if (len > bufsize) len = bufsize;
@@ -662,11 +801,10 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
     // Prefetch buffer is shared by all targets, so it is only valid for the
     // target it was filled from - and only at the sector size it was read
     // with, which can change when removable media is swapped.
-    if (g_msc_initiator_state.prefetch_done &&
-        g_msc_initiator_state.prefetch_target_id == target_id &&
-        g_msc_initiator_state.prefetch_sectorsize == (size_t)sectorsize)
+    if (prefetch_usable(target_id, sectorsize))
     {
         int32_t offset = (int32_t)lba - (int32_t)g_msc_initiator_state.prefetch_lba;
+        g_msc_initiator_state.prefetch_time = platform_millis();
         uint8_t *dest = (uint8_t*)buffer;
         while (offset >= 0 && offset < g_msc_initiator_state.prefetch_sectorcount && sectorcount > 0)
         {
@@ -706,7 +844,10 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
         }
         else if (sense_key == UNIT_ATTENTION)
         {
-            dbgmsg("SCSI Initiator read: UNIT_ATTENTION");
+            // Nothing was read into the buffer. Returning success here would send
+            // the host whatever the USB buffer last held.
+            note_media_change(lun);
+            return -1;
         }
         else
         {
@@ -719,9 +860,7 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
     // walking towards, so a read-ahead window is fetched once and then served
     // from RAM instead of being discarded and re-read on every request.
     uint32_t disk_sectorcount = g_msc_initiator_targets[lun].sectorcount;
-    bool covered = g_msc_initiator_state.prefetch_done
-                && g_msc_initiator_state.prefetch_target_id == target_id
-                && g_msc_initiator_state.prefetch_sectorsize == (size_t)sectorsize
+    bool covered = prefetch_usable(target_id, sectorsize)
                 && lba >= g_msc_initiator_state.prefetch_lba
                 && lba < g_msc_initiator_state.prefetch_lba + g_msc_initiator_state.prefetch_sectorcount;
 

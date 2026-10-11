@@ -46,4 +46,7 @@ void platform_exit_msc();
 void platform_msc_lock_set(bool block);
 bool platform_msc_lock_get();
 
+/* Set the sense data the USB host gets for its next REQUEST SENSE on this LUN */
+void platform_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t asc, uint8_t ascq);
+
 #endif

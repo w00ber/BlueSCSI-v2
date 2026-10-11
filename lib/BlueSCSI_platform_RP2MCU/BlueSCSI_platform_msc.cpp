@@ -233,6 +233,11 @@ void platform_exit_msc() {
    g_MSC.unitReady = 0;
 }
 
+void platform_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t asc, uint8_t ascq)
+{
+  tud_msc_set_sense(lun, sense_key, asc, ascq);
+}
+
 /* TinyUSB mass storage callbacks follow */
 
 // usb framework checks this func exists for mass storage config. no code needed.
