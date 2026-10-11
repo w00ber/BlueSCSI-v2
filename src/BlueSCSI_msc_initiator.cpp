@@ -125,6 +125,11 @@ static struct {
     // would otherwise get the new cartridge's sector for a request it made
     // about the old one. Indexed by LUN.
     bool revalidate[NUM_SCSIID];
+
+    // Lock the drive's eject button while the host is using the medium, so that
+    // removable media only leave through a host-initiated eject. Indexed by LUN.
+    bool lock_media;
+    bool media_locked[NUM_SCSIID];
 } g_msc_initiator_state;
 
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
@@ -233,6 +238,7 @@ bool setup_msc_initiator()
 
     g_msc_initiator_state.status_interval = ini_getl("SCSI", "InitiatorMSCStatusInterval", 5000, CONFIGFILE);
     g_msc_initiator_state.readonly = ini_getbool("SCSI", "InitiatorMSCReadOnly", false, CONFIGFILE);
+    g_msc_initiator_state.lock_media = ini_getbool("SCSI", "InitiatorMSCLockMedia", true, CONFIGFILE);
 
     if (g_msc_initiator_state.readonly)
     {
@@ -396,6 +402,38 @@ static void note_media_change(uint8_t lun, const char *reason)
     {
         g_msc_initiator_state.media_changed[lun] = true;
         g_msc_initiator_state.revalidate[lun] = true;
+        g_msc_initiator_state.media_locked[lun] = false;
+    }
+}
+
+// Send PREVENT ALLOW MEDIUM REMOVAL to a removable target. Hosts such as macOS
+// don't lock USB media themselves and don't poll for removal while a medium is
+// present: a cartridge ejected with the drive's button leaves the host retrying
+// reads to a medium that is gone. Locking the button means media only leave
+// through the host's eject, which init_msc_start_stop_cb() unlocks first.
+static void set_media_lock(uint8_t lun, bool lock)
+{
+    if (!g_msc_initiator_state.lock_media || lun >= NUM_SCSIID || !is_removable_device(lun) ||
+        g_msc_initiator_state.media_locked[lun] == lock)
+    {
+        return;
+    }
+
+    int target = get_target(lun);
+    uint8_t command[6] = {0x1E, 0, 0, 0, (uint8_t)(lock ? 1 : 0), 0};
+    int status = scsiInitiatorRunCommand(target, command, sizeof(command), NULL, 0, NULL, 0);
+
+    if (status == 0)
+    {
+        logmsg(lock ? "Locked" : "Unlocked", " media removal on SCSI ID ", target);
+        g_msc_initiator_state.media_locked[lun] = lock;
+    }
+    else
+    {
+        uint8_t sense_key = 0;
+        if (status == 2) scsiRequestSense(target, &sense_key);
+        scsiLogInitiatorCommandFailure("PREVENT ALLOW MEDIUM REMOVAL", target, status, sense_key);
+        g_msc_initiator_state.media_locked[lun] = false;
     }
 }
 
@@ -518,6 +556,7 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
     if (load_eject && is_removable_device(lun))
     {
         invalidate_prefetch();
+        if (!start) set_media_lock(lun, false);
         logmsg(start ? "Loading removable media" : "Ejecting removable media");
         command[4] |= 2;
     }
@@ -574,6 +613,7 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
     if (status == 0)
     {
         medium_revalidated(lun);
+        set_media_lock(lun, true);
         return true;
     }
     else if (status != 2)
@@ -596,6 +636,8 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
         // e.g. NOT READY / MEDIUM NOT PRESENT (3A) or BECOMING READY (04/01)
         platform_msc_set_sense(lun, sense_key, asc, ascq);
     }
+
+    if (lun < NUM_SCSIID) g_msc_initiator_state.media_locked[lun] = false;
 
     return false;
 }
@@ -625,6 +667,7 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
         }
 
         medium_revalidated(lun);
+        set_media_lock(lun, true);
 
         // Remember the current capacity so it survives a not-ready phase
         g_msc_initiator_targets[lun].sectorcount = sectorcount;
