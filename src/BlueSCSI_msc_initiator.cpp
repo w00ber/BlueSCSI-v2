@@ -441,8 +441,8 @@ void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[1
     if (g_msc_initiator_target_count == 0)
     {
         memset(vendor_id, 0, 8);
-        memset(product_id, 0, 8);
-        memset(product_rev, 0, 8);
+        memset(product_id, 0, 16);
+        memset(product_rev, 0, 4);
         return;
     }
 
